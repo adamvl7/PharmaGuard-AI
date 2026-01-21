@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 
 from db import engine, SessionLocal
 from models import DrugLabel, DrugLabelChunk
+from fastapi.middleware.cors import CORSMiddleware
+
 
 import os
 import re
@@ -13,6 +15,14 @@ import math
 from sentence_transformers import SentenceTransformer
 
 app = FastAPI(title="PharmaGuard API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -25,27 +35,39 @@ def get_db():
         db.close()
 
 
-def chunk_text(text: str, max_chars: int = 1000, overlap: int = 150):
-    """
-    Splits long text into overlapping chunks.
-    max_chars: target chunk size in characters
-    overlap: repeated tail chars to preserve context
-    """
+def chunk_text(text: str, max_chars: int = 1000, overlap_sentences: int = 1):
     if not text:
         return []
 
-    text = text.strip()
-    chunks = []
-    start = 0
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r'(?<=[.!?])\s+', text)
 
-    while start < len(text):
-        end = min(start + max_chars, len(text))
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == len(text):
-            break
-        start = end - overlap
+    chunks = []
+    cur = []
+    cur_len = 0
+
+    for s in sentences:
+        if not s:
+            continue
+        add_len = len(s) + (1 if cur else 0)
+
+        if cur_len + add_len <= max_chars:
+            cur.append(s)
+            cur_len += add_len
+        else:
+            # flush
+            if cur:
+                chunks.append(" ".join(cur).strip())
+
+            # overlap last N sentences to preserve context
+            cur = cur[-overlap_sentences:] if overlap_sentences > 0 else []
+            cur_len = len(" ".join(cur))
+
+            cur.append(s)
+            cur_len = len(" ".join(cur))
+
+    if cur:
+        chunks.append(" ".join(cur).strip())
 
     return chunks
 
@@ -99,6 +121,28 @@ def retrieve_semantic(db: Session, label_id: int, question: str, limit: int = 6)
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [r for _, r in scored[:limit]]
+
+
+def best_sentence(text: str, keywords: list[str], max_len: int = 240) -> str:
+    if not text:
+        return ""
+
+    # Split into sentence-ish chunks
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+
+    # Pick the first sentence that contains a keyword
+    for s in sentences:
+        s_low = s.lower()
+        if any(k in s_low for k in keywords) and len(s.strip()) > 20:
+            return s.strip()[:max_len]
+
+    # Fallback: first "reasonable" sentence
+    for s in sentences:
+        if len(s.strip()) > 40:
+            return s.strip()[:max_len]
+
+    # Final fallback
+    return text.strip()[:max_len]
 
 
 @app.get("/health")
@@ -261,6 +305,13 @@ async def ingest_fda_label(
 
     db.commit()
 
+    # Auto-embed chunks for this label
+    rows = db.query(DrugLabelChunk).filter(DrugLabelChunk.label_id == row.id).all()
+    vecs = embed_texts([r.text for r in rows])
+    for r, v in zip(rows, vecs):
+        r.embedding = json.dumps(v)
+    db.commit()
+
     return {
         "status": "stored",
         "id": row.id,
@@ -355,46 +406,69 @@ def db_tables():
     return {"tables": [r[0] for r in rows]}
 
 @app.post("/chat")
-def chat(label_id: int, question: str, db: Session = Depends(get_db)):
-    top = retrieve_semantic(db, label_id, question, limit=6)
+async def chat(
+    label_id: int,
+    question: str,
+    db: Session = Depends(get_db),
+):
+    q = question.lower()
 
-    if not top:
+    keywords = []
+    if "interaction" in q:
+        keywords += ["interaction", "interact"]
+    if "warning" in q or "risk" in q or "bleeding" in q:
+        keywords += ["warning", "bleeding", "risk", "ulcer", "stroke", "heart"]
+    if "dose" in q:
+        keywords += ["dose", "dosage"]
+    if "contra" in q:
+        keywords += ["contraindication"]
+
+    if not keywords:
+        keywords = ["warning", "interaction", "risk"]
+
+    # Prefer semantic if embeddings exist, fallback to keyword
+    sem = retrieve_semantic(db, label_id, question, limit=6)
+    if sem:
+        matched = sem
+    else:
+        matched = retrieve_chunks(db, label_id, question, limit=6)
+
+    if not matched:
         return {
             "answer": [
                 "I couldn't find relevant FDA label sections for that question.",
-                "Try asking about: drug interactions, warnings, contraindications, adverse reactions, or dosage."
+                "Try asking about: drug interactions, warnings, contraindications, adverse reactions, or dosage.",
             ],
             "safety_note": "Not medical advice. Confirm with a pharmacist/clinician.",
             "citations": [],
-            "evidence": []
+            "evidence": [],
         }
 
-    # Build evidence list + citations
-    evidence = []
-    citations = []
-    for r in top:
-        evidence.append({
-            "chunk_id": r.id,
-            "section": r.section,
-            "chunk_index": r.chunk_index,
-            "preview": r.text[:350]
-        })
-        citations.append({
-            "chunk_id": r.id,
-            "section": r.section,
-            "chunk_index": r.chunk_index
-        })
-
-    # Simple "extractive" answer: top 3 relevant excerpts, with citations
     answer_lines = []
-    for i, r in enumerate(top[:3], start=1):
-        answer_lines.append(f"Relevant excerpt {i} ({r.section}): {r.text[:300]}... [chunk {r.id}]")
+    evidence = []
+
+    for c in matched:
+        snippet = best_sentence(c.text, keywords)
+        answer_lines.append(f"• {snippet}...")
+        evidence.append({
+            "chunk_id": c.id,
+            "section": c.section,
+            "chunk_index": c.chunk_index,
+            "preview": c.text[:200] + ("..." if len(c.text) > 200 else ""),
+        })
 
     return {
         "answer": answer_lines,
-        "safety_note": "Not medical advice. This is FDA label text. Confirm with a pharmacist/clinician.",
-        "citations": citations,
-        "evidence": evidence
+        "safety_note": "Not medical advice. Confirm with a pharmacist/clinician.",
+        "citations": [
+            {
+                "chunk_id": c["chunk_id"],
+                "section": c["section"],
+                "chunk_index": c["chunk_index"],
+            }
+            for c in evidence
+        ],
+        "evidence": evidence,
     }
 
 @app.post("/compare")
