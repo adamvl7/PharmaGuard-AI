@@ -1,16 +1,10 @@
-\# PharmaGuard AI – Devlog
+# PharmaGuard AI – Devlog
 
-
-
-\## 2026-01-16
-
-\- Built FastAPI backend for FDA label ingestion (openFDA)
-
-\- Implemented chunking + PostgreSQL storage (SQLAlchemy)
-
-\- Added semantic retrieval (local embeddings) and citation based chat endpoint
-
-\- Added drug–drug comparison endpoint for interaction evidence
+## 2026-01-16
+- Built FastAPI backend for FDA label ingestion (openFDA)
+- Implemented chunking + PostgreSQL storage (SQLAlchemy)
+- Added semantic retrieval (local embeddings) and citation-based chat endpoint
+- Added drug–drug comparison endpoint for interaction evidence
 
 ## 2026-01-21
 - Integrated SentenceTransformers embeddings into backend for semantic search
@@ -22,5 +16,9 @@
 - Added compare-drugs logic to backend (semantic interaction search)
 - Refactored main.py for modular retrieval + embedding workflow
 - Cleaned up .gitignore and removed tracked pycache artifacts
+- Polished UI layout and spacing for a more professional startup look
+- Resolved overlapping and unclickable UI elements (chat + controls)
+- Implemented chat-by-drug flow for clearer user interactions
 - Pushed MVP updates to GitHub with structured commit history
+
 
