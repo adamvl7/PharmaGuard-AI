@@ -2,6 +2,7 @@
 import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from datetime import datetime
 
 from db import engine, SessionLocal
 from models import DrugLabel, DrugLabelChunk
@@ -470,6 +471,36 @@ async def chat(
         ],
         "evidence": evidence,
     }
+
+@app.post("/chat-by-drug")
+async def chat_by_drug(
+    drug: str = Query(min_length=1, max_length=200),
+    question: str = Query(min_length=1, max_length=2000),
+    db: Session = Depends(get_db),
+):
+    # 1) Find most recent label for this drug (user might type brand/generic variants)
+    existing = (
+        db.query(DrugLabel)
+        .filter(DrugLabel.input_name.ilike(f"%{drug}%"))
+        .order_by(DrugLabel.created_at.desc())
+        .first()
+    )
+
+    # 2) If not found, auto-ingest
+    if not existing:
+        # reuse your ingest logic directly (call function or inline minimal)
+        stored = await ingest_fda_label(drug=drug, db=db)  # calls your POST /ingest logic
+        label_id = stored["id"]
+    else:
+        label_id = existing.id
+
+    # 3) Run your existing chat on that label_id
+    result = await chat(label_id=label_id, question=question, db=db)
+
+    # 4) Include label_id for UI display
+    if isinstance(result, dict):
+        result["label_id"] = label_id
+    return result
 
 @app.post("/compare")
 def compare(drug_a: str, drug_b: str, db: Session = Depends(get_db)):

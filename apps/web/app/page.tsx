@@ -14,6 +14,7 @@ type ChatResponse = {
   safety_note?: string;
   citations?: { chunk_id: number; section: string; chunk_index: number }[];
   evidence?: EvidenceItem[];
+  label_id?: number; // from /chat-by-drug (optional but nice)
 };
 
 type ChunkResponse = {
@@ -24,6 +25,19 @@ type ChunkResponse = {
   text: string;
 };
 
+type CompareResponse = {
+  status: string;
+  message?: string;
+  label_ids?: { drug_a: number; drug_b: number };
+  drug_a?: { name: string; label_id: number };
+  drug_b?: { name: string; label_id: number };
+  summary?: string[];
+  evidence?: {
+    from_drug_a_label: EvidenceItem[];
+    from_drug_b_label: EvidenceItem[];
+  };
+};
+
 type IngestResponse = {
   status: string;
   id: number;
@@ -32,295 +46,533 @@ type IngestResponse = {
   chunks_stored?: number;
 };
 
-export default function Home() {
+function cx(...xs: Array<string | false | undefined | null>) {
+  return xs.filter(Boolean).join(" ");
+}
+
+function sectionLabel(section: string) {
+  const map: Record<string, string> = {
+    indications_and_usage: "Indications",
+    contraindications: "Contraindications",
+    warnings: "Warnings",
+    warnings_and_cautions: "Warnings & Cautions",
+    drug_interactions: "Drug Interactions",
+    adverse_reactions: "Adverse Reactions",
+    dosage_and_administration: "Dosage",
+  };
+  return map[section] || section;
+}
+
+function sectionBadgeClass(section: string) {
+  if (section.includes("contra")) return "bg-rose-50 text-rose-700 border-rose-200";
+  if (section.includes("warning")) return "bg-amber-50 text-amber-800 border-amber-200";
+  if (section.includes("interaction")) return "bg-indigo-50 text-indigo-700 border-indigo-200";
+  if (section.includes("dosage")) return "bg-emerald-50 text-emerald-700 border-emerald-200";
+  if (section.includes("adverse")) return "bg-violet-50 text-violet-700 border-violet-200";
+  return "bg-sky-50 text-sky-700 border-sky-200";
+}
+
+function TopButton({ label, onClick }: { label: string; onClick?: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition active:scale-[0.99]"
+    >
+      {label}
+    </button>
+  );
+}
+
+function Pill({
+  label,
+  onClick,
+}: {
+  label: string;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition active:scale-[0.99]"
+    >
+      {label}
+      <span className="text-[10px] opacity-60">⌄</span>
+    </button>
+  );
+}
+
+export default function Page() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
-  // NEW: Drug loader
+  const [mode, setMode] = useState<"chat" | "ingest" | "compare">("chat");
+
+  // inputs
   const [drugName, setDrugName] = useState<string>("ibuprofen");
-  const [loadStatus, setLoadStatus] = useState<string>("");
-
-  // Keep labelId but users shouldn’t type it normally
-  const [labelId, setLabelId] = useState<string>("");
-
-  // Chat
   const [question, setQuestion] = useState<string>(
-    'What does the FDA label say about drug interactions and bleeding risk?'
+    "What does the FDA label say about bleeding risk and interactions?"
   );
-  const [loading, setLoading] = useState<boolean>(false);
-  const [chat, setChat] = useState<ChatResponse | null>(null);
 
-  // Citation viewer
+  const [drugA, setDrugA] = useState<string>("ibuprofen");
+  const [drugB, setDrugB] = useState<string>("aspirin");
+
+  // results
+  const [busy, setBusy] = useState<boolean>(false);
+  const [drawerOpen, setDrawerOpen] = useState<boolean>(true);
+
+  const [chat, setChat] = useState<ChatResponse | null>(null);
+  const [compareResult, setCompareResult] = useState<CompareResponse | null>(null);
+  const [ingestStatus, setIngestStatus] = useState<string | null>(null);
+
+  // citation viewer
   const [selectedChunkId, setSelectedChunkId] = useState<number | null>(null);
   const [chunkText, setChunkText] = useState<string>("");
+  const [chunkMeta, setChunkMeta] = useState<{ section?: string; chunk_index?: number } | null>(null);
 
-  const canLoadDrug = useMemo(() => {
-    return drugName.trim().length > 0 && !loading;
-  }, [drugName, loading]);
+  const canRun = useMemo(() => {
+    if (busy) return false;
+    if (mode === "ingest") return drugName.trim().length > 0;
+    if (mode === "compare") return drugA.trim().length > 0 && drugB.trim().length > 0;
+    return drugName.trim().length > 0 && question.trim().length > 0;
+  }, [busy, mode, drugName, question, drugA, drugB]);
 
-  const canAsk = useMemo(() => {
-    return labelId.trim().length > 0 && question.trim().length > 0 && !loading;
-  }, [labelId, question, loading]);
-
-  async function loadDrug() {
-    setLoading(true);
-    setChat(null);
-    setSelectedChunkId(null);
-    setChunkText("");
-    setLoadStatus("Loading drug…");
+  async function openChunk(ev: EvidenceItem) {
+    setSelectedChunkId(ev.chunk_id);
+    setChunkText("Loading excerpt…");
+    setChunkMeta({ section: ev.section, chunk_index: ev.chunk_index });
 
     try {
-      // 1) Ingest label
-      const ingestUrl = new URL(`${API}/ingest/fda-label`);
-      ingestUrl.searchParams.set("drug", drugName.trim());
-
-      const ingestRes = await fetch(ingestUrl.toString(), { method: "POST" });
-      if (!ingestRes.ok) {
-        const text = await ingestRes.text();
-        throw new Error(`Ingest failed (${ingestRes.status}): ${text}`);
-      }
-      const ingestData = (await ingestRes.json()) as IngestResponse;
-
-      // 2) Set label id in UI
-      setLabelId(String(ingestData.id));
-
-      // 3) Embed label (semantic search)
-      const embedUrl = new URL(`${API}/embed/label`);
-      embedUrl.searchParams.set("label_id", String(ingestData.id));
-
-      const embedRes = await fetch(embedUrl.toString(), { method: "POST" });
-      if (!embedRes.ok) {
-        const text = await embedRes.text();
-        throw new Error(`Embed failed (${embedRes.status}): ${text}`);
-      }
-
-      setLoadStatus(
-        `Loaded “${drugName.trim()}” → Label ID ${ingestData.id}${
-          ingestData.chunks_stored ? ` (${ingestData.chunks_stored} chunks)` : ""
-        }`
-      );
-    } catch (e: any) {
-      setLoadStatus(`Error: ${e?.message || "Unknown error"}`);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function runChat() {
-    setLoading(true);
-    setChat(null);
-    setSelectedChunkId(null);
-    setChunkText("");
-
-    try {
-      const url = new URL(`${API}/chat`);
-      url.searchParams.set("label_id", labelId.trim());
-      url.searchParams.set("question", question.trim());
-
-      const res = await fetch(url.toString(), { method: "POST" });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Chat failed (${res.status}): ${text}`);
-      }
-      const data = (await res.json()) as ChatResponse;
-      setChat(data);
-    } catch (e: any) {
-      setChat({
-        answer: [`Error: ${e?.message || "Unknown error"}`],
-      });
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function openChunk(chunkId: number) {
-    setSelectedChunkId(chunkId);
-    setChunkText("Loading…");
-
-    try {
-      const res = await fetch(`${API}/chunks/${chunkId}`);
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Chunk fetch failed (${res.status}): ${text}`);
-      }
+      const res = await fetch(`${API}/chunks/${ev.chunk_id}`);
+      if (!res.ok) throw new Error(`Chunk fetch failed: ${res.status}`);
       const data = (await res.json()) as ChunkResponse;
       setChunkText(data.text);
+      setChunkMeta({ section: data.section, chunk_index: data.chunk_index });
     } catch (e: any) {
-      setChunkText(`Error: ${e?.message || "Unknown error"}`);
+      setChunkText(`❌ ${e?.message || "Unknown error"}`);
+    }
+  }
+
+  async function run() {
+    setBusy(true);
+    setDrawerOpen(true);
+    setSelectedChunkId(null);
+    setChunkText("");
+    setChunkMeta(null);
+
+    setChat(null);
+    setCompareResult(null);
+    setIngestStatus(null);
+
+    try {
+      if (mode === "ingest") {
+        setIngestStatus("Fetching FDA label via openFDA…");
+        const url = new URL(`${API}/ingest/fda-label`);
+        url.searchParams.set("drug", drugName.trim());
+
+        const res = await fetch(url.toString(), { method: "POST" });
+        if (!res.ok) throw new Error(`Ingest failed: ${res.status}`);
+        const data = (await res.json()) as IngestResponse;
+        setIngestStatus(
+          `✅ Ingested "${data.input}" • Label ID ${data.id} • Stored ${data.chunks_stored ?? 0} chunks`
+        );
+      } else if (mode === "compare") {
+        const url = new URL(`${API}/compare`);
+        url.searchParams.set("drug_a", drugA.trim());
+        url.searchParams.set("drug_b", drugB.trim());
+
+        const res = await fetch(url.toString(), { method: "POST" });
+        if (!res.ok) throw new Error(`Compare failed: ${res.status}`);
+        const data = (await res.json()) as CompareResponse;
+        setCompareResult(data);
+      } else {
+        // Startup-grade flow: chat by drug name (backend resolves label_id)
+        const url = new URL(`${API}/chat-by-drug`);
+        url.searchParams.set("drug", drugName.trim());
+        url.searchParams.set("question", question.trim());
+
+        const res = await fetch(url.toString(), { method: "POST" });
+        if (!res.ok) throw new Error(`Chat failed: ${res.status}`);
+        const data = (await res.json()) as ChatResponse;
+        setChat(data);
+      }
+    } catch (e: any) {
+      if (mode === "compare") setCompareResult({ status: "error", message: e?.message || "Unknown error" });
+      else if (mode === "ingest") setIngestStatus(`❌ ${e?.message || "Unknown error"}`);
+      else setChat({ answer: [`❌ ${e?.message || "Unknown error"}`] });
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
-    <main style={{ maxWidth: 1100, margin: "0 auto", padding: 24, fontFamily: "system-ui" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700 }}>PharmaGuard AI</h1>
-      <p style={{ marginTop: 8, opacity: 0.85 }}>
-        Ask questions grounded in official FDA label text. Responses include citations you can open.
-      </p>
+    <div className="min-h-screen bg-white text-slate-900">
+      {/* NAV: always clickable */}
+      <header className="sticky top-0 z-[60] border-b border-slate-200 bg-white/80 backdrop-blur">
+        <div className="mx-auto max-w-7xl px-4 py-3 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-indigo-500 to-sky-500 shadow-sm flex items-center justify-center text-white font-black">
+              P
+            </div>
+            <div className="leading-tight">
+              <div className="text-sm font-semibold text-slate-900">PharmaGuard AI</div>
+              <div className="text-xs text-slate-500">New insight</div>
+            </div>
+          </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 20 }}>
-        <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
-          <h2 style={{ fontSize: 16, fontWeight: 600 }}>Load a drug</h2>
-
-          <label style={{ display: "block", marginTop: 12, fontSize: 13, opacity: 0.8 }}>
-            Drug name (generic or brand)
-          </label>
-
-          <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-            <input
-              value={drugName}
-              onChange={(e) => setDrugName(e.target.value)}
-              placeholder="e.g., ibuprofen"
-              style={{ flex: 1, padding: 10, borderRadius: 10, border: "1px solid #ccc" }}
-            />
+          <div className="flex items-center gap-2">
+            <TopButton label="Share" onClick={() => alert("Share coming soon")} />
+            <TopButton label="Select Project" onClick={() => alert("Projects coming soon")} />
             <button
-              onClick={loadDrug}
-              disabled={!canLoadDrug}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: canLoadDrug ? "#111" : "#666",
-                color: "white",
-                cursor: canLoadDrug ? "pointer" : "not-allowed",
-                fontWeight: 600,
-                whiteSpace: "nowrap",
+              type="button"
+              onClick={() => {
+                setChat(null);
+                setCompareResult(null);
+                setIngestStatus(null);
+                setSelectedChunkId(null);
+                setChunkText("");
+                setQuestion("");
+                setDrawerOpen(true);
               }}
+              className="rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 transition active:scale-[0.99]"
             >
-              {loading ? "Loading…" : "Load"}
+              + New Chat
             </button>
           </div>
+        </div>
+      </header>
 
-          <div style={{ marginTop: 10, fontSize: 13, opacity: 0.9 }}>
-            <div>
-              <strong>Active label:</strong>{" "}
-              {labelId ? <span>{labelId}</span> : <span style={{ opacity: 0.7 }}>None loaded yet</span>}
-            </div>
-            {loadStatus ? <div style={{ marginTop: 6, opacity: 0.8 }}>{loadStatus}</div> : null}
-          </div>
-
-          <hr style={{ margin: "16px 0", border: "none", borderTop: "1px solid #eee" }} />
-
-          <h2 style={{ fontSize: 16, fontWeight: 600 }}>Ask a question</h2>
-
-          <label style={{ display: "block", marginTop: 12, fontSize: 13, opacity: 0.8 }}>
-            Question
-          </label>
-          <textarea
-            value={question}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder='Try: "What does the label say about interactions with blood thinners?"'
-            rows={4}
-            style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc", marginTop: 6 }}
-          />
-
-          <button
-            onClick={runChat}
-            disabled={!canAsk}
-            style={{
-              marginTop: 12,
-              padding: "10px 14px",
-              borderRadius: 10,
-              border: "1px solid #111",
-              background: canAsk ? "#111" : "#666",
-              color: "white",
-              cursor: canAsk ? "pointer" : "not-allowed",
-              fontWeight: 600,
-            }}
-          >
-            {loading ? "Asking…" : "Ask"}
-          </button>
-
-          <details style={{ marginTop: 12 }}>
-            <summary style={{ cursor: "pointer", fontSize: 12, opacity: 0.8 }}>Advanced</summary>
-            <div style={{ marginTop: 10 }}>
-              <label style={{ display: "block", fontSize: 13, opacity: 0.8 }}>Label ID (override)</label>
-              <input
-                value={labelId}
-                onChange={(e) => setLabelId(e.target.value)}
-                placeholder="e.g., 12"
-                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc", marginTop: 6 }}
-              />
-              <p style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
-                Normally you won’t need this. Loading a drug sets the label automatically.
-              </p>
-            </div>
-          </details>
-
-          {chat && (
-            <div style={{ marginTop: 16 }}>
-              <h3 style={{ fontSize: 14, fontWeight: 700 }}>Answer</h3>
-              <ul style={{ marginTop: 8, paddingLeft: 18 }}>
-                {chat.answer?.map((line, idx) => (
-                  <li key={idx} style={{ marginBottom: 8 }}>
-                    {line}
-                  </li>
-                ))}
-              </ul>
-
-              {chat.safety_note && (
-                <p style={{ marginTop: 10, fontSize: 12, opacity: 0.8 }}>{chat.safety_note}</p>
-              )}
-
-              {chat.evidence && chat.evidence.length > 0 && (
-                <>
-                  <h3 style={{ fontSize: 14, fontWeight: 700, marginTop: 16 }}>Citations</h3>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 8 }}>
-                    {chat.evidence.map((ev) => (
-                      <button
-                        key={ev.chunk_id}
-                        onClick={() => openChunk(ev.chunk_id)}
-                        style={{
-                          textAlign: "left",
-                          padding: 10,
-                          borderRadius: 10,
-                          border: "1px solid #ccc",
-                          background: "white",
-                          cursor: "pointer",
-                        }}
-                      >
-                        <div style={{ fontWeight: 700, fontSize: 13 }}>
-                          Chunk {ev.chunk_id} • {ev.section} • #{ev.chunk_index}
-                        </div>
-                        <div style={{ fontSize: 12, opacity: 0.85, marginTop: 4 }}>{ev.preview}</div>
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-        </section>
-
-        <section style={{ border: "1px solid #ddd", borderRadius: 12, padding: 16 }}>
-          <h2 style={{ fontSize: 16, fontWeight: 600 }}>Selected Citation</h2>
-          <p style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
-            Click a citation on the left to view the full FDA label excerpt.
-          </p>
-
+      <main className="mx-auto max-w-7xl px-4 py-6">
+        <div className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+          {/* Decorative layers MUST NOT capture clicks */}
           <div
+            className="pointer-events-none absolute inset-0 opacity-[0.45]"
             style={{
-              marginTop: 12,
-              padding: 12,
-              borderRadius: 10,
-              border: "1px solid #ccc",
-              minHeight: 320,
-              whiteSpace: "pre-wrap",
+              backgroundImage:
+                "linear-gradient(to right, rgba(15, 23, 42, 0.06) 1px, transparent 1px), linear-gradient(to bottom, rgba(15, 23, 42, 0.06) 1px, transparent 1px)",
+              backgroundSize: "44px 44px",
             }}
-          >
-            {selectedChunkId ? (
-              <>
-                <div style={{ fontWeight: 700, marginBottom: 8 }}>Chunk {selectedChunkId}</div>
-                {chunkText}
-              </>
-            ) : (
-              <span style={{ opacity: 0.7 }}>No citation selected.</span>
-            )}
-          </div>
-        </section>
-      </div>
+          />
+          <div className="pointer-events-none absolute -top-24 left-1/2 h-72 w-72 -translate-x-1/2 rounded-full bg-gradient-to-b from-indigo-200 to-sky-200 blur-2xl opacity-60" />
 
-      <footer style={{ marginTop: 24, fontSize: 12, opacity: 0.75 }}>
-        Data source: openFDA. This tool is for educational use only and does not provide medical advice.
-      </footer>
-    </main>
+          {/* Content */}
+          <div className="relative min-h-[680px]">
+            {/* Canvas center */}
+            <div className="flex flex-col items-center justify-center px-6 text-center pt-14 pb-48">
+              {/* orb */}
+              <div className="relative mb-8 pointer-events-none">
+                <div className="h-44 w-44 rounded-full bg-gradient-to-b from-indigo-500 to-sky-400 opacity-90 shadow-lg" />
+                <div className="absolute inset-0 rounded-full bg-[radial-gradient(circle_at_30%_30%,rgba(255,255,255,0.65),transparent_55%)]" />
+                <div className="absolute left-1/2 top-1/2 w-[290px] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-slate-200 bg-white/80 backdrop-blur px-4 py-3 shadow-sm">
+                  <div className="flex items-center gap-3">
+                    <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-indigo-500 to-sky-500" />
+                    <div className="flex-1 text-left">
+                      <div className="h-2.5 w-40 rounded bg-slate-200" />
+                      <div className="mt-2 h-2 w-56 rounded bg-slate-100" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <h1 className="text-4xl sm:text-5xl font-semibold tracking-tight">
+                Let the <span className="text-indigo-600">Label</span> Speak
+              </h1>
+              <p className="mt-3 max-w-2xl text-sm sm:text-base text-slate-600">
+                Ask FDA-grounded questions. Get evidence with citations you can open — built for clinical-grade clarity.
+              </p>
+
+              {/* Mode switch */}
+              <div className="mt-7 inline-flex rounded-2xl border border-slate-200 bg-white/80 backdrop-blur p-1 shadow-sm">
+                {(["chat", "ingest", "compare"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setMode(m)}
+                    className={cx(
+                      "px-4 py-2 text-sm font-semibold rounded-xl transition",
+                      mode === m ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50"
+                    )}
+                  >
+                    {m === "chat" ? "Chat" : m === "ingest" ? "Ingest" : "Compare"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Bottom controls area (NO overlap) */}
+            <div className="absolute inset-x-0 bottom-0 px-6 pb-6">
+              {/* Pills row ABOVE input bar */}
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-3 relative z-[40]">
+                <div className="flex flex-wrap gap-2">
+                  <Pill label="User Journey" onClick={() => alert("Coming soon")} />
+                  <Pill label="Audience" onClick={() => alert("Coming soon")} />
+                  <Pill label="Event" onClick={() => alert("Coming soon")} />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => alert("Saved prompts coming soon")}
+                  className="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition active:scale-[0.99]"
+                >
+                  ✨ Saved Prompts
+                </button>
+              </div>
+
+              {/* Input bar */}
+              <div className="mx-auto max-w-4xl rounded-2xl border border-slate-200 bg-white/95 backdrop-blur shadow-sm relative z-[45]">
+                <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center">
+                  <div className="flex-1 space-y-2">
+                    {mode === "compare" ? (
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <input
+                          value={drugA}
+                          onChange={(e) => setDrugA(e.target.value)}
+                          placeholder="Drug A (e.g., ibuprofen)"
+                          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:ring-4 focus:ring-indigo-100 focus:border-indigo-300"
+                        />
+                        <input
+                          value={drugB}
+                          onChange={(e) => setDrugB(e.target.value)}
+                          placeholder="Drug B (e.g., aspirin)"
+                          className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:ring-4 focus:ring-indigo-100 focus:border-indigo-300"
+                        />
+                      </div>
+                    ) : (
+                      <input
+                        value={drugName}
+                        onChange={(e) => setDrugName(e.target.value)}
+                        placeholder="Drug name (e.g., ibuprofen)"
+                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:ring-4 focus:ring-sky-100 focus:border-sky-300"
+                      />
+                    )}
+
+                    {mode === "chat" && (
+                      <input
+                        value={question}
+                        onChange={(e) => setQuestion(e.target.value)}
+                        placeholder="What's your next insight? Ask and find out."
+                        className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:ring-4 focus:ring-sky-100 focus:border-sky-300"
+                      />
+                    )}
+
+                    {mode === "ingest" && (
+                      <div className="text-xs text-slate-500">
+                        This fetches from openFDA and stores chunks for evidence-based retrieval.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDrawerOpen((v) => !v)}
+                      className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition active:scale-[0.99]"
+                    >
+                      {drawerOpen ? "Hide" : "Show"} Results
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={run}
+                      disabled={!canRun}
+                      className={cx(
+                        "rounded-xl px-4 py-2 text-sm font-semibold text-white shadow-sm transition active:scale-[0.99]",
+                        canRun ? "bg-indigo-600 hover:bg-indigo-700" : "bg-slate-300 cursor-not-allowed"
+                      )}
+                    >
+                      {busy ? "Working…" : mode === "ingest" ? "Ingest" : mode === "compare" ? "Compare" : "Ask"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="px-4 pb-3 text-[11px] text-slate-500">
+                  Data source: openFDA. Educational use only. Not medical advice.
+                </div>
+              </div>
+            </div>
+
+            {/* Right drawer (clickable) */}
+            <div
+              className={cx(
+                "absolute top-0 right-0 h-full w-full sm:w-[520px] border-l border-slate-200 bg-white/95 backdrop-blur transition-transform duration-300 z-[55]",
+                drawerOpen ? "translate-x-0" : "translate-x-full"
+              )}
+            >
+              <div className="h-full flex flex-col">
+                <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-semibold">Results</div>
+                    <div className="text-xs text-slate-500">
+                      {mode === "chat"
+                        ? "Answer + citations"
+                        : mode === "compare"
+                        ? "Evidence across both labels"
+                        : "Ingest status"}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDrawerOpen(false)}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 transition active:scale-[0.99]"
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <div className="flex-1 overflow-auto p-4 space-y-4">
+                  {/* Ingest */}
+                  {mode === "ingest" && (
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-800">
+                      {ingestStatus || "Run ingest to see status here."}
+                    </div>
+                  )}
+
+                  {/* Chat */}
+                  {mode === "chat" && (
+                    <>
+                      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                        <div className="flex items-center justify-between">
+                          <div className="text-sm font-semibold">Answer</div>
+                          {chat?.label_id ? (
+                            <div className="text-xs text-slate-500">Label ID: {chat.label_id}</div>
+                          ) : null}
+                        </div>
+
+                        {chat?.answer ? (
+                          <ul className="mt-3 list-disc pl-5 space-y-2 text-sm text-slate-800">
+                            {chat.answer.map((a, i) => (
+                              <li key={i}>{a}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <div className="mt-3 text-sm text-slate-500">Ask a question to generate an answer.</div>
+                        )}
+
+                        {chat?.safety_note && (
+                          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+                            {chat.safety_note}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                        <div className="text-sm font-semibold">Citations</div>
+                        <div className="mt-3 space-y-2">
+                          {(chat?.evidence || []).length === 0 ? (
+                            <div className="text-sm text-slate-500">No citations yet.</div>
+                          ) : (
+                            chat!.evidence!.map((ev) => (
+                              <button
+                                type="button"
+                                key={ev.chunk_id}
+                                onClick={() => openChunk(ev)}
+                                className="w-full text-left rounded-xl border border-slate-200 bg-white px-4 py-3 hover:bg-slate-50 transition active:scale-[0.99]"
+                              >
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span
+                                    className={cx(
+                                      "rounded-full border px-2.5 py-1 text-[11px] font-semibold",
+                                      sectionBadgeClass(ev.section)
+                                    )}
+                                  >
+                                    {sectionLabel(ev.section)}
+                                  </span>
+                                  <span className="text-[11px] text-slate-500">
+                                    Chunk {ev.chunk_id} • #{ev.chunk_index}
+                                  </span>
+                                </div>
+                                <div className="mt-2 text-xs text-slate-600 line-clamp-2">{ev.preview}</div>
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  {/* Compare */}
+                  {mode === "compare" && (
+                    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                      {compareResult ? (
+                        <>
+                          {compareResult.status === "error" && (
+                            <div className="text-sm text-slate-800">❌ {compareResult.message}</div>
+                          )}
+
+                          {compareResult.status === "needs_embeddings" && (
+                            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                              {compareResult.message}
+                              {compareResult.label_ids && (
+                                <div className="mt-2 text-xs text-amber-900/80">
+                                  Label IDs: A={compareResult.label_ids.drug_a}, B={compareResult.label_ids.drug_b}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {compareResult.status === "ok" && (
+                            <>
+                              <div className="text-sm font-semibold">
+                                {compareResult.drug_a?.name} vs {compareResult.drug_b?.name}
+                              </div>
+
+                              {compareResult.summary && (
+                                <ul className="mt-2 list-disc pl-5 text-xs text-slate-600 space-y-1">
+                                  {compareResult.summary.map((s, i) => (
+                                    <li key={i}>{s}</li>
+                                  ))}
+                                </ul>
+                              )}
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        <div className="text-sm text-slate-500">Run a comparison to see evidence here.</div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Citation viewer */}
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm font-semibold">Selected Citation</div>
+                      {selectedChunkId && <span className="text-xs text-slate-500">Chunk {selectedChunkId}</span>}
+                    </div>
+
+                    <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-4 min-h-[180px] whitespace-pre-wrap text-sm text-slate-800">
+                      {selectedChunkId ? (
+                        <>
+                          <div className="mb-3 flex flex-wrap items-center gap-2">
+                            {chunkMeta?.section && (
+                              <span
+                                className={cx(
+                                  "rounded-full border px-2.5 py-1 text-[11px] font-semibold",
+                                  sectionBadgeClass(chunkMeta.section)
+                                )}
+                              >
+                                {sectionLabel(chunkMeta.section)}
+                              </span>
+                            )}
+                            {typeof chunkMeta?.chunk_index === "number" && (
+                              <span className="text-[11px] text-slate-500">#{chunkMeta.chunk_index}</span>
+                            )}
+                          </div>
+                          {chunkText}
+                        </>
+                      ) : (
+                        <div className="text-slate-500">Click a citation card to view the excerpt.</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="p-4 border-t border-slate-200 text-[11px] text-slate-500">
+                  Educational use only. Not medical advice. Confirm with a pharmacist/clinician.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
   );
 }
